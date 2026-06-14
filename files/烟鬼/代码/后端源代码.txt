@@ -1,8 +1,8 @@
 // ============================================================
-// 龙铭仓库 · Worker v13.0 增强版 (完整版)
+// 龙铭仓库 · Worker v13.1 修复版（完整）
 // ★ 使用前请修改 REPO_OWNER 和 REPO_NAME ★
 // ============================================================
-const INVITE_CODES = {   // 多邀请码 -> 角色
+const INVITE_CODES = {
   'longming888': 'admin',
   'guest2024': 'readonly'
 };
@@ -33,7 +33,10 @@ const corsHeaders = {
 };
 
 function json(data, status = 200) {
-  return new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { 'Content-Type': 'application/json', ...corsHeaders }
+  });
 }
 
 // ========== 密码工具 ==========
@@ -79,7 +82,7 @@ async function verifyJWT(token, secret) {
   } catch { return null; }
 }
 
-// ========== GitHub API (接受 token) ==========
+// ========== GitHub API ==========
 async function ghAPI(token, path, method='GET', body=null, retries=3) {
   const url = `https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/contents/${path}`;
   const hdrs = {
@@ -120,7 +123,6 @@ function b64Enc(str) {
   return btoa(bin);
 }
 
-// 获取原始 Base64 (不解码) - 用于二进制合并
 async function ghRawContent(token, path) {
   const url = `https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/contents/${path}`;
   const res = await fetch(url, {
@@ -130,23 +132,13 @@ async function ghRawContent(token, path) {
   const data = await res.json();
   return { content: data.content, sha: data.sha };
 }
-
-// 上传原始 Base64 内容
 async function ghRawUpload(token, path, base64Content, sha) {
   const url = `https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/contents/${path}`;
-  const body = {
-    message: 'Upload',
-    content: base64Content,
-    branch: BRANCH
-  };
+  const body = { message: 'Upload', content: base64Content, branch: BRANCH };
   if (sha) body.sha = sha;
   const res = await fetch(url, {
     method: 'PUT',
-    headers: {
-      'Authorization': `token ${token}`,
-      'Content-Type': 'application/json',
-      'User-Agent': 'CloudflareWorker'
-    },
+    headers: { 'Authorization': `token ${token}`, 'Content-Type': 'application/json', 'User-Agent': 'CloudflareWorker' },
     body: JSON.stringify(body)
   });
   if (!res.ok) throw new Error(`Upload failed (${res.status}): ${await res.text()}`);
@@ -191,11 +183,7 @@ async function moveFile(token, oldPath, newPath) {
   });
   await fetch(`https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/contents/${oldPath}`, {
     method: 'DELETE',
-    headers: {
-      'Authorization': `token ${token}`,
-      'Content-Type': 'application/json',
-      'User-Agent': 'CloudflareWorker'
-    },
+    headers: { 'Authorization': `token ${token}`, 'Content-Type': 'application/json', 'User-Agent': 'CloudflareWorker' },
     body: JSON.stringify({ message: `Remove old ${oldPath}`, sha: old.sha, branch: BRANCH })
   });
   return true;
@@ -212,7 +200,6 @@ async function deleteRemoteFile(token, folder, sub, file) {
   }
 }
 
-// ========== 速率限制 ==========
 function getClientIP(request) {
   return request.headers.get('CF-Connecting-IP') ||
          request.headers.get('X-Forwarded-For')?.split(',')[0]?.trim() ||
@@ -247,9 +234,9 @@ export default {
     try {
       console.log(`[${new Date().toISOString()}] ${request.method} ${path} from ${ip}`);
 
-      if (path === '/') return json({ version: '13.0', status: 'running' });
+      if (path === '/') return json({ version: '13.1', status: 'running' });
 
-      // ═════════════════════ 注册 ═════════════════════
+      // ========== 注册 ==========
       if (path === '/register' && request.method === 'POST') {
         const { username, password, secondPassword, inviteCode, email } = await request.json();
         if (!username || !password || !secondPassword) return json({ error: '缺少必填项' }, 400);
@@ -266,20 +253,19 @@ export default {
 
         const salt = crypto.randomUUID(), secondSalt = crypto.randomUUID();
         users.push({
-          username,
-          email: email || '',
+          username, email: email || '',
           passwordHash: await hashPassword(password, salt),
           secondHash:   await hashPassword(secondPassword, secondSalt),
           salt, secondSalt,
           hashVersion: 'pbkdf2',
-          role          // 存储角色
+          role
         });
         const cur = await ghAPI(GITHUB_TOKEN, 'users.json');
         await writeJSON(GITHUB_TOKEN, 'users.json', users, cur.sha);
         return json({ success: true });
       }
 
-      // ═════════════════════ 登录第一步 ═════════════════════
+      // ========== 登录第一步 ==========
       if (path === '/login' && request.method === 'POST') {
         if (!checkRL(ip)) return json({ error: '登录尝试过多，请15分钟后再试' }, 429);
         const { username, password } = await request.json();
@@ -310,7 +296,7 @@ export default {
         return json({ partialToken, username: user.username, email: user.email, role: user.role });
       }
 
-      // ═════════════════════ 登录第二步 ═════════════════════
+      // ========== 登录第二步 ==========
       if (path === '/verify-second-password' && request.method === 'POST') {
         async function getAuth(req, secret, mustFull) {
           const auth = req.headers.get('Authorization') || '';
@@ -358,7 +344,7 @@ export default {
         return json({ token, username: user.username, email: user.email, role: user.role });
       }
 
-      // ═════════════════════ 鉴权中间件 ═════════════════════
+      // ========== 鉴权中间件 ==========
       async function fullAuth(req) {
         const auth = req.headers.get('Authorization') || '';
         if (!auth.startsWith('Bearer ')) return null;
@@ -367,19 +353,15 @@ export default {
         if (!payload || payload.partial === true) return null;
         return payload;
       }
-
       const auth = await fullAuth(request);
       if (!auth) return json({ error: '未授权，请重新登录' }, 401);
 
-      // 只读用户检查辅助
       function checkWritePermission() {
-        if (auth.role === 'readonly') {
-          return json({ error: '只读账户无法执行此操作' }, 403);
-        }
+        if (auth.role === 'readonly') return json({ error: '只读账户无法执行此操作' }, 403);
         return null;
       }
 
-      // ═════════════════════ 获取文件系统 ═════════════════════
+      // ========== 获取文件系统 ==========
       if (path === '/get-fs' && request.method === 'GET') {
         let fs = await readJSON(GITHUB_TOKEN, 'fileSystem.json', null);
         if (!fs?.folders) {
@@ -400,36 +382,32 @@ export default {
         });
       }
 
-      // ═════════════════════ 更新文件系统 ═════════════════════
+      // ========== 更新文件系统 ==========
       if (path === '/update-fs' && request.method === 'PUT') {
         const permErr = checkWritePermission(); if (permErr) return permErr;
         const newData = await request.json();
         if (!Array.isArray(newData?.folders)) return json({ error: '无效数据' }, 400);
-
         const existing = await readJSON(GITHUB_TOKEN, 'fileSystem.json', { folders:[], trash:[] });
         newData.folders = newData.folders.map(nf => {
           const old = (existing.folders||[]).find(f => f.name === nf.name);
           const { hasPassword, password, ...clean } = nf;
           return { ...clean, passwordHash: old?.passwordHash||'', passwordSalt: old?.passwordSalt||'' };
         });
-        // 保留现有的 trash（前端可能没发送 trash）
         const merged = { folders: newData.folders, trash: newData.trash || existing.trash || [] };
         const cur = await ghAPI(GITHUB_TOKEN, 'fileSystem.json');
         await writeJSON(GITHUB_TOKEN, 'fileSystem.json', merged, cur.sha);
         return json({ success: true });
       }
 
-      // ═════════════════════ 文件夹密码设置 ═════════════════════
+      // ========== 文件夹密码设置 ==========
       if (path === '/set-folder-password' && request.method === 'POST') {
         const permErr = checkWritePermission(); if (permErr) return permErr;
         const { folderName, password } = await request.json();
         if (!folderName) return json({ error: '缺少文件夹名' }, 400);
-
         const fs = await readJSON(GITHUB_TOKEN, 'fileSystem.json', null);
-        if (!fs) return json({ error: '文件系统不存在' }, 404);
+        if (!fs) return json({ error: 'FS不存在' }, 404);
         const folder = fs.folders.find(f => f.name === folderName);
         if (!folder) return json({ error: '文件夹不存在' }, 404);
-
         if (password) {
           const salt = crypto.randomUUID();
           folder.passwordHash = await hashPassword(password, salt);
@@ -443,12 +421,12 @@ export default {
         return json({ success: true });
       }
 
-      // ═════════════════════ 验证文件夹密码 ═════════════════════
+      // ========== 验证文件夹密码 ==========
       if (path === '/verify-folder-password' && request.method === 'POST') {
         const { folderName, password } = await request.json();
         if (!folderName || !password) return json({ error: '参数错误' }, 400);
         const fs = await readJSON(GITHUB_TOKEN, 'fileSystem.json', null);
-        if (!fs) return json({ error: '文件系统不存在' }, 404);
+        if (!fs) return json({ error: 'FS不存在' }, 404);
         const folder = fs.folders.find(f => f.name === folderName);
         if (!folder) return json({ error: '文件夹不存在' }, 404);
         if (!folder.passwordHash) return json({ success: true });
@@ -457,7 +435,7 @@ export default {
         return json({ success: true });
       }
 
-      // ═════════════════════ 回收站：移入 ═════════════════════
+      // ========== 回收站：移入 ==========
       if (path === '/move-to-trash' && request.method === 'POST') {
         const permErr = checkWritePermission(); if (permErr) return permErr;
         const { type, folder, sub, fileName } = await request.json();
@@ -494,7 +472,7 @@ export default {
         return json({ success: true });
       }
 
-      // ═════════════════════ 回收站：恢复 ═════════════════════
+      // ========== 回收站：恢复 ==========
       if (path === '/restore-from-trash' && request.method === 'POST') {
         const permErr = checkWritePermission(); if (permErr) return permErr;
         const { index } = await request.json();
@@ -505,10 +483,9 @@ export default {
 
         if (item.type === 'file') {
           const folderObj = fs.folders.find(f => f.name === item.folder);
-          if (!folderObj) return json({ error: '原文件夹不存在，无法恢复' }, 400);
+          if (!folderObj) return json({ error: '原文件夹不存在' }, 400);
           const subObj = folderObj.children.find(c => c.name === item.sub);
           if (!subObj) {
-            // 如果子分类也被删了，重新创建
             folderObj.children.push({ name: item.sub, files: [] });
             const newSub = folderObj.children.find(c => c.name === item.sub);
             newSub.files.push(item.file);
@@ -528,7 +505,7 @@ export default {
         return json({ success: true });
       }
 
-      // ═════════════════════ 回收站：永久删除 ═════════════════════
+      // ========== 回收站：永久删除 ==========
       if (path === '/permanent-delete' && request.method === 'POST') {
         const permErr = checkWritePermission(); if (permErr) return permErr;
         const { index } = await request.json();
@@ -537,7 +514,6 @@ export default {
         const item = fs.trash[index];
         if (!item) return json({ error: '项目不存在' }, 404);
 
-        // 物理删除 GitHub 文件
         if (item.type === 'file') {
           await deleteRemoteFile(GITHUB_TOKEN, item.folder, item.sub, item.file.name);
         } else if (item.type === 'sub') {
@@ -557,12 +533,11 @@ export default {
         return json({ success: true });
       }
 
-      // ═════════════════════ 兼容旧删除端点（转为回收站） ═════════════════════
+      // ========== 兼容旧删除（移入回收站） ==========
       if (path === '/delete-file' && request.method === 'POST') {
         const permErr = checkWritePermission(); if (permErr) return permErr;
         const { folder, subFolder, fileName } = await request.json();
         if (!folder || !subFolder || !validFileName(fileName)) return json({ error: '参数错误' }, 400);
-        // 直接调用回收站逻辑
         const fs = await readJSON(GITHUB_TOKEN, 'fileSystem.json', null);
         if (!fs) return json({ error: 'FS不存在' }, 404);
         if (!fs.trash) fs.trash = [];
@@ -579,7 +554,7 @@ export default {
         return json({ success: true });
       }
 
-      // ═════════════════════ 重命名文件夹 ═════════════════════
+      // ========== 重命名文件夹 ==========
       if (path === '/rename-folder' && request.method === 'POST') {
         const permErr = checkWritePermission(); if (permErr) return permErr;
         const { oldName, newName } = await request.json();
@@ -593,7 +568,7 @@ export default {
         return json({ success: true, moved: files.length });
       }
 
-      // ═════════════════════ 重命名子分类 ═════════════════════
+      // ========== 重命名子分类 ==========
       if (path === '/rename-sub' && request.method === 'POST') {
         const permErr = checkWritePermission(); if (permErr) return permErr;
         const { folder, oldSub, newSub } = await request.json();
@@ -607,7 +582,7 @@ export default {
         return json({ success: true, moved: files.length });
       }
 
-      // ═════════════════════ 分片上传 (修复二进制) ═════════════════════
+      // ========== 分片上传（使用 ghRawContent） ==========
       if (path === '/upload-chunk' && request.method === 'POST') {
         const permErr = checkWritePermission(); if (permErr) return permErr;
         const { fileName, folder, subFolder, chunkIndex, totalChunks, data, mime } = await request.json();
@@ -632,7 +607,6 @@ export default {
           const exFile = await ghAPI(GITHUB_TOKEN, targetPath);
           await ghRawUpload(GITHUB_TOKEN, targetPath, fullContent, exFile?.sha);
 
-          // 删除临时分片
           for (let i=0; i<totalChunks; i++) {
             const cpath = `chunks/${encodeURIComponent(fileName)}/${i}`;
             const cm = await ghAPI(GITHUB_TOKEN, cpath);
@@ -649,18 +623,22 @@ export default {
         return json({ success: true });
       }
 
-      // ═════════════════════ 下载文件 ═════════════════════
+      // ========== 下载文件（⭐ 修复：使用 ghRawContent） ==========
       if (path === '/download-file' && request.method === 'GET') {
         const folder = url.searchParams.get('folder');
         const sub = url.searchParams.get('sub');
         const file = url.searchParams.get('file');
         if (!folder || !sub || !file) return json({ error: '缺少参数' }, 400);
-        const d = await ghAPI(GITHUB_TOKEN, fileStoragePath(folder, sub, file));
-        if (!d?.content) return json({ error: '文件不存在' }, 404);
-        return new Response(d.content, { headers: { 'Content-Type': 'text/plain', ...corsHeaders } });
+
+        const raw = await ghRawContent(GITHUB_TOKEN, fileStoragePath(folder, sub, file));
+        if (!raw || !raw.content) return json({ error: '文件不存在' }, 404);
+
+        return new Response(raw.content, {
+          headers: { 'Content-Type': 'text/plain', ...corsHeaders }
+        });
       }
 
-      // ═════════════════════ 编辑文件 ═════════════════════
+      // ========== 编辑文本文件 ==========
       if (path === '/edit-file' && request.method === 'POST') {
         const permErr = checkWritePermission(); if (permErr) return permErr;
         const { folder, subFolder, fileName, content } = await request.json();
@@ -679,7 +657,7 @@ export default {
         return json({ success: true });
       }
 
-      // ═════════════════════ 更新个人资料 ═════════════════════
+      // ========== 更新个人资料 ==========
       if (path === '/update-profile' && request.method === 'POST') {
         const { oldPassword, newPassword, oldSecondPassword, newSecondPassword, newUsername } = await request.json();
         const users = await readJSON(GITHUB_TOKEN, 'users.json', []);
