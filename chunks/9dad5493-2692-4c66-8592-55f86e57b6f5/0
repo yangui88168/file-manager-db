@@ -1,0 +1,839 @@
+// ==================== 配置 ====================
+const REPO_OWNER = 'yangui88168';
+const REPO_NAME = 'file-manager-db';
+const BRANCH = 'main';
+const MAX_EDIT_SIZE = 500 * 1024;           // 文本编辑上限 500KB
+const MAX_UPLOAD_SIZE = 100 * 1024 * 1024;  // 普通文件上传上限 100MB
+const MAX_AVATAR_SIZE = 500 * 1024;         // 头像上限 500KB
+const MAX_BG_SIZE = 2 * 1024 * 1024;        // 背景图片上限 2MB
+const TOKEN_EXPIRY = 86400;                 // 完整 Token 24 小时
+const PARTIAL_EXPIRY = 60;                  // 部分 Token 60 秒
+
+const INVITE_CODES = { 'longming888': 'admin', 'guest2024': 'readonly' };
+
+const corsHeaders = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization'
+};
+
+// ==================== 工具函数 ====================
+function json(data, status = 200) {
+  return new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+}
+
+function generateInviteCode() {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  let code = '';
+  for (let i = 0; i < 8; i++) code += chars.charAt(Math.floor(Math.random() * chars.length));
+  return code;
+}
+
+function getClientIP(request) {
+  return request.headers.get('CF-Connecting-IP') ||
+         request.headers.get('X-Forwarded-For')?.split(',')[0]?.trim() ||
+         request.headers.get('X-Real-IP') || 'unknown';
+}
+
+function getUAHash(request) {
+  const ua = request.headers.get('User-Agent') || '';
+  return btoa(ua).substring(0, 20);
+}
+
+function validFileName(name) {
+  return typeof name === 'string' && name.length > 0 && name.length <= 200 && !name.includes('..') && !name.includes('/') && !name.includes('\\');
+}
+
+function sanitizePath(segment) {
+  if (!segment || typeof segment !== 'string') throw new Error('Invalid path segment');
+  const decoded = decodeURIComponent(segment);
+  if (decoded.includes('..') || decoded.includes('\\')) throw new Error('Path traversal detected');
+  return decoded;
+}
+
+async function hashPassword(password, salt) {
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey('raw', enc.encode(password), 'PBKDF2', false, ['deriveBits']);
+  const buf = await crypto.subtle.deriveBits(
+    { name: 'PBKDF2', salt: enc.encode(salt), iterations: 100000, hash: 'SHA-256' }, key, 256);
+  return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+// ==================== JWT ====================
+const b64u = s => btoa(s).replace(/=/g,'').replace(/\+/g,'-').replace(/\//g,'_');
+const b64uDec = s => { s = s.replace(/-/g,'+').replace(/_/g,'/'); while (s.length % 4) s += '='; return atob(s); };
+
+async function signJWT(payload, secret) {
+  const h = b64u(JSON.stringify({ alg:'HS256', typ:'JWT' }));
+  const p = b64u(JSON.stringify(payload));
+  const data = `${h}.${p}`;
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name:'HMAC', hash:'SHA-256' }, false, ['sign']);
+  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(data));
+  const s = btoa(String.fromCharCode(...new Uint8Array(sig))).replace(/=/g,'').replace(/\+/g,'-').replace(/\//g,'_');
+  return `${data}.${s}`;
+}
+
+async function verifyJWT(token, secret) {
+  try {
+    const parts = token.split('.');
+    if (parts.length !== 3) return null;
+    const [h, p, s] = parts;
+    const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name:'HMAC', hash:'SHA-256' }, false, ['verify']);
+    const sigBytes = Uint8Array.from(b64uDec(s), c => c.charCodeAt(0));
+    const valid = await crypto.subtle.verify('HMAC', key, sigBytes, new TextEncoder().encode(`${h}.${p}`));
+    if (!valid) return null;
+    const payload = JSON.parse(b64uDec(p));
+    if (payload.exp < Math.floor(Date.now() / 1000)) return null;
+    return payload;
+  } catch { return null; }
+}
+
+// ==================== 黑名单 ====================
+const tokenBlacklist = new Map();
+function addToBlacklist(jti, exp) {
+  tokenBlacklist.set(jti, exp * 1000);
+  for (const [k, t] of tokenBlacklist) if (Date.now() > t) tokenBlacklist.delete(k);
+}
+function isBlacklisted(jti) {
+  if (!jti) return false;
+  const expiry = tokenBlacklist.get(jti);
+  if (!expiry) return false;
+  if (Date.now() > expiry) { tokenBlacklist.delete(jti); return false; }
+  return true;
+}
+
+// ==================== 限流与锁定 ====================
+const rateLimitMap = new Map();
+const failureLock = new Map();
+
+function checkRateLimit(ip, action, max, windowMs) {
+  const lock = failureLock.get(ip);
+  if (lock && Date.now() < lock.lockUntil) {
+    return { allowed: false, remaining: 0, locked: true };
+  }
+  const key = `${ip}:${action}`;
+  const now = Date.now();
+  const entry = rateLimitMap.get(key);
+  if (!entry || now > entry.reset) {
+    rateLimitMap.set(key, { count: 1, reset: now + windowMs });
+    return { allowed: true, remaining: max - 1 };
+  }
+  if (entry.count >= max) {
+    if (action === 'login' || action === '2fa') {
+      failureLock.set(ip, { lockUntil: now + 30 * 60 * 1000, count: (lock?.count || 0) + 1 });
+    }
+    return { allowed: false, remaining: 0 };
+  }
+  entry.count++;
+  return { allowed: true, remaining: max - entry.count };
+}
+
+function clearRateLimit(ip, action) {
+  const key = `${ip}:${action}`;
+  rateLimitMap.delete(key);
+  failureLock.delete(ip);
+}
+
+// ==================== 审计日志 ====================
+const auditLogs = [];
+function addAuditLog(action, user, ip) {
+  const entry = { time: new Date().toISOString(), user, ip, action };
+  auditLogs.push(entry);
+  if (auditLogs.length > 1000) auditLogs.shift();
+  console.log(`AUDIT: ${JSON.stringify(entry)}`);
+}
+
+// ==================== GitHub 存储（带冲突重试） ====================
+class GitHubStorage {
+  constructor(token) { this.token = token; }
+  base() { return `https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}`; }
+  async request(path, method='GET', body=null, retries=3) {
+    const url = `${this.base()}/contents/${path}`;
+    const hdrs = { 'Authorization':`token ${this.token}`, 'User-Agent':'CloudflareWorker', 'Content-Type':'application/json' };
+    const opts = { method, headers: hdrs };
+    if (body) opts.body = JSON.stringify(body);
+    for (let attempt = 1; attempt <= retries; attempt++) {
+      const res = await fetch(url, opts);
+      if (res.status === 409 && attempt < retries) {
+        await new Promise(r => setTimeout(r, 200 * attempt));
+        continue;
+      }
+      if (res.status === 409) return { conflict: true };
+      if (res.status === 404) return null;
+      if (!res.ok) throw new Error(`GitHub ${method} ${path} (${res.status})`);
+      const data = await res.json();
+      if (data.content) {
+    const binary = atob(data.content.replace(/\n/g, ''));
+    const bytes = Uint8Array.from(binary, c => c.charCodeAt(0));
+    data.content = new TextDecoder('utf-8').decode(bytes);
+}
+      return data;
+    }
+    return { conflict: true };
+  }
+  async readJSON(path, def=null) {
+    const d = await this.request(path);
+    if (d && !d.conflict && d.content) { try { return JSON.parse(d.content); } catch { return def; } }
+    return def;
+  }
+  async writeJSON(path, data, sha=null) {
+    const jsonText = JSON.stringify(data);
+const bytes = new TextEncoder().encode(jsonText);
+
+let binary = '';
+for (const b of bytes) {
+    binary += String.fromCharCode(b);
+}
+
+const content = btoa(binary);
+    const body = { message:`Update ${path}`, content, branch:BRANCH };
+    if (sha) body.sha = sha;
+    const res = await this.request(path, 'PUT', body);
+    if (res?.conflict) return { conflict:true };
+    return res;
+  }
+  async uploadFile(path, b64content, sha=null) {
+    const body = { message:`Upload ${path}`, content:b64content, branch:BRANCH };
+    if (sha) body.sha = sha;
+    const res = await this.request(path, 'PUT', body);
+    if (res?.conflict) return { conflict:true };
+    return res;
+  }
+  async deleteFile(path, sha) {
+    const url = `${this.base()}/contents/${path}`;
+    const res = await fetch(url, {
+      method:'DELETE',
+      headers: { 'Authorization':`token ${this.token}`, 'User-Agent':'CloudflareWorker', 'Content-Type':'application/json' },
+      body: JSON.stringify({ message:`Delete ${path}`, sha, branch:BRANCH })
+    });
+    if (!res.ok) throw new Error(`Delete failed: ${await res.text()}`);
+  }
+  async getContent(path) { const d = await this.request(path); return d?.content || null; }
+  async listFiles(prefix) {
+    const url = `${this.base()}/git/trees/${BRANCH}?recursive=1`;
+    const res = await fetch(url, { headers: { 'Authorization':`token ${this.token}`, 'User-Agent':'CloudflareWorker' } });
+    if (!res.ok) throw new Error('Failed list tree');
+    const data = await res.json();
+    return data.tree.filter(f=>f.type==='blob' && f.path.startsWith(prefix)).map(f=>f.path);
+  }
+}
+
+// ==================== 文件系统辅助 ====================
+function createDefaultPublicFS() {
+  return {
+    version:1,
+    folders:[
+      { id:crypto.randomUUID(), name:'公共资料', passwordHash:'', passwordSalt:'', children:[
+          { id:crypto.randomUUID(), name:'公告', files:[] }, { id:crypto.randomUUID(), name:'模板', files:[] }, { id:crypto.randomUUID(), name:'图片', files:[] }
+      ]},
+      { id:crypto.randomUUID(), name:'项目资料', passwordHash:'', passwordSalt:'', children:[
+          { id:crypto.randomUUID(), name:'项目A', files:[] }, { id:crypto.randomUUID(), name:'项目B', files:[] }, { id:crypto.randomUUID(), name:'项目C', files:[] }
+      ]},
+      { id:crypto.randomUUID(), name:'财务资料', passwordHash:'', passwordSalt:'', children:[
+          { id:crypto.randomUUID(), name:'报销', files:[] }, { id:crypto.randomUUID(), name:'合同', files:[] }, { id:crypto.randomUUID(), name:'发票', files:[] }
+      ]}
+    ], trash:[]
+  };
+}
+function createDefaultPrivateFS() {
+  return {
+    version:1,
+    folders:[
+      { id:crypto.randomUUID(), name:'我的文件', passwordHash:'', passwordSalt:'', children:[
+          { id:crypto.randomUUID(), name:'文档', files:[] }, { id:crypto.randomUUID(), name:'图片', files:[] }, { id:crypto.randomUUID(), name:'其他', files:[] }
+      ]}
+    ], trash:[]
+  };
+}
+function fileStoragePath(scope, username, folder, sub, file) {
+  const sf = sanitizePath(folder), ss = sanitizePath(sub), sf2 = sanitizePath(file);
+  const prefix = scope==='public' ? 'public_files' : `private_files/${encodeURIComponent(username)}`;
+  return `${prefix}/${encodeURIComponent(sf)}/${encodeURIComponent(ss)}/${encodeURIComponent(sf2)}`;
+}
+
+// 合并文件夹密码（保留旧密码哈希）
+function mergeFolderSecurity(oldFolders, newFolders) {
+  return newFolders.map(nf => {
+    const old = oldFolders.find(f => f.id === nf.id);
+    return {
+      ...nf,
+      passwordHash: old ? old.passwordHash : (nf.passwordHash || ''),
+      passwordSalt: old ? old.passwordSalt : (nf.passwordSalt || '')
+    };
+  });
+}
+
+// ==================== 认证中间件（含设备绑定） ====================
+async function requireAuth(request, env, type='full') {
+  const auth = request.headers.get('Authorization')||'';
+  if (!auth.startsWith('Bearer ')) return null;
+  const token = auth.slice(7);
+  const payload = await verifyJWT(token, env.JWT_SECRET);
+  if (!payload) return null;
+  if (payload.jti && isBlacklisted(payload.jti)) return null;
+  const currentIP = getClientIP(request);
+  const currentUA = getUAHash(request);
+  if (payload.ip && payload.ip !== currentIP) return null;
+  if (payload.ua && payload.ua !== currentUA) return null;
+  if (type==='full' && payload.type!=='full') return null;
+  return payload;
+}
+
+// ==================== 主 Worker ====================
+export default {
+  async fetch(request, env) {
+    if (request.method==='OPTIONS') return new Response(null, { headers:corsHeaders });
+    if (!env.GITHUB_TOKEN_SECRET) throw new Error('GITHUB_TOKEN_SECRET missing');
+    if (!env.JWT_SECRET) throw new Error('JWT_SECRET missing');
+    const GITHUB_TOKEN = env.GITHUB_TOKEN_SECRET;
+    const JWT_SECRET = env.JWT_SECRET;
+    const url = new URL(request.url);
+    const path = url.pathname;
+    const ip = getClientIP(request);
+    const uaHash = getUAHash(request);
+    const storage = new GitHubStorage(GITHUB_TOKEN);
+
+    try {
+      // ==================== 公开路由 ====================
+      if (path==='/register' && request.method==='POST') {
+        const rl = checkRateLimit(ip, 'register', 3, 3600000);
+        if (!rl.allowed) return json({ success:false, error:'注册次数过多，请稍后再试' }, 429);
+        const { username, password, secondPassword, inviteCode, email } = await request.json();
+        if (!username || !password || !secondPassword) return json({ success:false, error:'缺少必填项' }, 400);
+        const users = await storage.readJSON('users.json', []);
+        if (!Array.isArray(users)) return json({ success:false, error:'系统错误' }, 500);
+        let role = INVITE_CODES[inviteCode] || null;
+        if (!role) { const inviter = users.find(u=>u.inviteCode===inviteCode); if (inviter) role = inviter.role || 'admin'; }
+        if (!role) return json({ success:false, error:'邀请码错误' }, 400);
+        if (username.length<4||username.length>20) return json({ success:false, error:'用户名需4-20字符' }, 400);
+        if (password.length<6) return json({ success:false, error:'密码至少6位' }, 400);
+        if (!/^\d{6}$/.test(secondPassword)) return json({ success:false, error:'二级密码必须为6位数字' }, 400);
+        if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return json({ success:false, error:'邮箱格式错误' }, 400);
+        if (users.find(u=>u.username===username)) return json({ success:false, error:'用户名已存在' }, 400);
+        if (email && users.some(u=>u.email===email)) return json({ success:false, error:'邮箱已被使用' }, 400);
+        let myInviteCode; do { myInviteCode = generateInviteCode(); } while (users.some(u=>u.inviteCode===myInviteCode)||INVITE_CODES[myInviteCode]);
+        const salt = crypto.randomUUID(), secondSalt = crypto.randomUUID();
+        const newUser = { username, email:email||'', passwordHash:await hashPassword(password,salt), secondHash:await hashPassword(secondPassword,secondSalt), salt, secondSalt, hashVersion:'pbkdf2', role, inviteCode:myInviteCode, avatar:'', background:'' };
+        users.push(newUser);
+        let fs = await storage.readJSON('fileSystem.json', { public:createDefaultPublicFS(), private:{} });
+        if (!fs.private) fs.private = {};
+        fs.private[username] = createDefaultPrivateFS();
+        const uSha = (await storage.request('users.json'))?.sha;
+        const fSha = (await storage.request('fileSystem.json'))?.sha;
+        const w1 = await storage.writeJSON('users.json', users, uSha);
+        if (w1?.conflict) return json({ success:false, error:'系统繁忙，请稍后重试' }, 409);
+        const w2 = await storage.writeJSON('fileSystem.json', fs, fSha);
+        if (w2?.conflict) return json({ success:false, error:'系统繁忙，请稍后重试' }, 409);
+        addAuditLog('register', username, ip);
+        return json({ success:true, data:{ inviteCode:myInviteCode } });
+      }
+
+      if (path==='/login' && request.method==='POST') {
+        const rl = checkRateLimit(ip, 'login', 5, 10 * 60000);
+        if (!rl.allowed) return json({ success:false, error:'登录尝试过多，请稍后再试' }, 429);
+        const { username, password } = await request.json();
+        if (!username || !password) return json({ success:false, error:'账号密码不能为空' }, 400);
+        const users = await storage.readJSON('users.json', []);
+        const user = users.find(u=>u.username===username || u.email===username);
+        if (!user) return json({ success:false, error:'账号或密码错误' }, 401);
+        const ok = (await hashPassword(password, user.salt)) === user.passwordHash;
+        if (!ok) return json({ success:false, error:'账号或密码错误' }, 401);
+        clearRateLimit(ip, 'login');
+        const partialToken = await signJWT({
+          username:user.username, role:user.role, type:'partial',
+          iat:Math.floor(Date.now()/1000), exp:Math.floor(Date.now()/1000)+PARTIAL_EXPIRY,
+          jti:crypto.randomUUID(), ip, ua:uaHash
+        }, JWT_SECRET);
+        return json({ success:true, data:{ partialToken, username:user.username, email:user.email, role:user.role, avatar:user.avatar||'' } });
+      }
+
+      if (path==='/verify-second-password' && request.method==='POST') {
+        const rl = checkRateLimit(ip, '2fa', 3, 10 * 60000);
+        if (!rl.allowed) return json({ success:false, error:'验证尝试过多，请稍后再试' }, 429);
+        const partial = await requireAuth(request, env, 'partial');
+        if (!partial) return json({ success:false, error:'请先完成第一步登录' }, 401);
+        const { secondPassword } = await request.json();
+        if (!secondPassword) return json({ success:false, error:'参数错误' }, 400);
+        const users = await storage.readJSON('users.json', []);
+        const user = users.find(u=>u.username===partial.username);
+        if (!user) return json({ success:false, error:'用户不存在' }, 401);
+        const salt = user.secondSalt||user.salt;
+        const ok = (await hashPassword(secondPassword, salt)) === user.secondHash;
+        if (!ok) return json({ success:false, error:'二级密码错误' }, 401);
+        clearRateLimit(ip, '2fa');
+        clearRateLimit(ip, 'login');
+        const fullToken = await signJWT({
+          username:user.username, role:user.role, type:'full',
+          iat:Math.floor(Date.now()/1000), exp:Math.floor(Date.now()/1000)+TOKEN_EXPIRY,
+          jti:crypto.randomUUID(), ip, ua:uaHash
+        }, JWT_SECRET);
+        addAuditLog('login_success', user.username, ip);
+        return json({ success:true, data:{ token:fullToken, username:user.username, email:user.email, role:user.role, inviteCode:user.inviteCode, avatar:user.avatar||'', background:user.background||'' } });
+      }
+
+      // ==================== 需要完整 token 的路由 ====================
+      const auth = await requireAuth(request, env, 'full');
+      if (!auth) return json({ success:false, error:'未授权，请重新登录' }, 401);
+
+      if (path==='/logout' && request.method==='POST') {
+        const token = (request.headers.get('Authorization')||'').slice(7);
+        const payload = await verifyJWT(token, JWT_SECRET);
+        if (payload?.jti) addToBlacklist(payload.jti, payload.exp);
+        addAuditLog('logout', auth.username, ip);
+        return json({ success:true, data:{} });
+      }
+
+      if (path==='/me' && request.method==='GET') {
+        const users = await storage.readJSON('users.json', []);
+        const user = users.find(u=>u.username===auth.username);
+        if (!user) return json({ success:false, error:'用户不存在' }, 404);
+        return json({ success:true, data:{ username:user.username, email:user.email, role:user.role, inviteCode:user.inviteCode, avatar:user.avatar||'', background:user.background||'' } });
+      }
+
+      if (path==='/get-fs' && request.method==='GET') {
+        let fs = await storage.readJSON('fileSystem.json', null);
+        if (!fs || !fs.public) { fs = { public:createDefaultPublicFS(), private:{} }; await storage.writeJSON('fileSystem.json', fs, (await storage.request('fileSystem.json'))?.sha); }
+        if (!fs.private) fs.private = {};
+        if (!fs.private[auth.username]) { fs.private[auth.username] = createDefaultPrivateFS(); await storage.writeJSON('fileSystem.json', fs, (await storage.request('fileSystem.json'))?.sha); }
+        const safePublic = fs.public.folders.map(f=>({ id:f.id, name:f.name, hasPassword:!!f.passwordHash, children:f.children||[] }));
+        const safePrivate = fs.private[auth.username].folders.map(f=>({ id:f.id, name:f.name, hasPassword:!!f.passwordHash, children:f.children||[] }));
+        return json({ success:true, data:{ public:{ ...fs.public, folders:safePublic }, private:{ ...fs.private[auth.username], folders:safePrivate }, username:auth.username, role:auth.role, version:fs.public.version } });
+      }
+
+      if (path==='/update-fs' && request.method==='PUT') {
+        if (auth.role==='readonly') return json({ success:false, error:'权限不足' }, 403);
+        const { scope, folders, trash, version } = await request.json();
+        if (!scope || !['public','private'].includes(scope)) return json({ success:false, error:'无效作用域' }, 400);
+        let fs = await storage.readJSON('fileSystem.json');
+        const container = scope==='public' ? fs.public : (fs.private?.[auth.username]||createDefaultPrivateFS());
+        if (version!==undefined && container.version!==version) return json({ success:false, error:'文件已被修改，请刷新' }, 409);
+        // 合并旧文件夹密码
+        const mergedFolders = mergeFolderSecurity(container.folders, folders);
+        container.folders = mergedFolders;
+        container.trash = trash||[];
+        container.version = (container.version||0)+1;
+        const sha = (await storage.request('fileSystem.json'))?.sha;
+        const wRes = await storage.writeJSON('fileSystem.json', fs, sha);
+        if (wRes?.conflict) return json({ success:false, error:'冲突，请刷新后重试' }, 409);
+        return json({ success:true, data:{ version:container.version } });
+      }
+
+      if (path==='/set-folder-password' && request.method==='POST') {
+        if (auth.role==='readonly') return json({ success:false, error:'权限不足' }, 403);
+        const { scope, folderId, password } = await request.json();
+        if (!scope || !folderId) return json({ success:false, error:'参数错误' }, 400);
+        let fs = await storage.readJSON('fileSystem.json');
+        const container = scope==='public' ? fs.public : (fs.private?.[auth.username]||createDefaultPrivateFS());
+        const folder = container.folders.find(f=>f.id===folderId);
+        if (!folder) return json({ success:false, error:'文件夹不存在' }, 404);
+        if (password) { const s = crypto.randomUUID(); folder.passwordHash = await hashPassword(password, s); folder.passwordSalt = s; }
+        else { folder.passwordHash = ''; folder.passwordSalt = ''; }
+        const sha = (await storage.request('fileSystem.json'))?.sha;
+        const wRes = await storage.writeJSON('fileSystem.json', fs, sha);
+        if (wRes?.conflict) return json({ success:false, error:'冲突，请刷新' }, 409);
+        return json({ success:true, data:{} });
+      }
+
+      if (path==='/verify-folder-password' && request.method==='POST') {
+        const { scope, folderId, password } = await request.json();
+        if (!scope || !folderId || !password) return json({ success:false, error:'参数错误' }, 400);
+        const fs = await storage.readJSON('fileSystem.json');
+        const container = scope==='public' ? fs.public : (fs.private?.[auth.username]||createDefaultPrivateFS());
+        const folder = container.folders.find(f=>f.id===folderId);
+        if (!folder) return json({ success:false, error:'文件夹不存在' }, 404);
+        if (!folder.passwordHash) return json({ success:true, data:{} });
+        const ok = (await hashPassword(password, folder.passwordSalt)) === folder.passwordHash;
+        if (!ok) return json({ success:false, error:'密码错误' }, 401);
+        return json({ success:true, data:{} });
+      }
+
+      if (path==='/move-to-trash' && request.method==='POST') {
+        if (auth.role==='readonly') return json({ success:false, error:'权限不足' }, 403);
+        const { scope, type, folderId, subId, fileName } = await request.json();
+        if (!scope || !type || !folderId) return json({ success:false, error:'参数错误' }, 400);
+        let fs = await storage.readJSON('fileSystem.json');
+        const container = scope==='public' ? fs.public : (fs.private?.[auth.username]||createDefaultPrivateFS());
+        if (!container.trash) container.trash = [];
+        if (type==='file') {
+          const fo = container.folders.find(f=>f.id===folderId);
+          if (!fo) return json({ success:false, error:'文件夹不存在' }, 404);
+          const sub = fo.children.find(c=>c.id===subId);
+          if (!sub) return json({ success:false, error:'子分类不存在' }, 404);
+          const idx = sub.files.findIndex(f=>f.name===fileName);
+          if (idx===-1) return json({ success:false, error:'文件不存在' }, 404);
+          const [obj] = sub.files.splice(idx,1);
+          container.trash.push({ type:'file', folderId, folderName:fo.name, subId, subName:sub.name, file:obj, deletedAt:Date.now() });
+        } else if (type==='sub') {
+          const fo = container.folders.find(f=>f.id===folderId);
+          if (!fo) return json({ success:false, error:'文件夹不存在' }, 404);
+          const idx = fo.children.findIndex(c=>c.id===subId);
+          if (idx===-1) return json({ success:false, error:'子分类不存在' }, 404);
+          const [obj] = fo.children.splice(idx,1);
+          container.trash.push({ type:'sub', folderId, folderName:fo.name, sub:obj, deletedAt:Date.now() });
+        } else if (type==='folder') {
+          const idx = container.folders.findIndex(f=>f.id===folderId);
+          if (idx===-1) return json({ success:false, error:'文件夹不存在' }, 404);
+          const [obj] = container.folders.splice(idx,1);
+          container.trash.push({ type:'folder', folder:obj, deletedAt:Date.now() });
+        }
+        const sha = (await storage.request('fileSystem.json'))?.sha;
+        const wRes = await storage.writeJSON('fileSystem.json', fs, sha);
+        if (wRes?.conflict) return json({ success:false, error:'冲突' }, 409);
+        addAuditLog(`move_to_trash_${type}`, auth.username, ip);
+        return json({ success:true, data:{} });
+      }
+
+      // /delete-file 直接删除（不移入回收站）
+      if (path==='/delete-file' && request.method==='POST') {
+        if (auth.role==='readonly') return json({ success:false, error:'权限不足' }, 403);
+        const { scope, folderId, subId, fileName } = await request.json();
+        if (!scope || !folderId || !subId || !fileName) return json({ success:false, error:'参数错误' }, 400);
+        let fs = await storage.readJSON('fileSystem.json');
+        const container = scope==='public' ? fs.public : (fs.private?.[auth.username]||createDefaultPrivateFS());
+        const folder = container.folders.find(f=>f.id===folderId);
+        if (!folder) return json({ success:false, error:'文件夹不存在' }, 404);
+        const sub = folder.children.find(c=>c.id===subId);
+        if (!sub) return json({ success:false, error:'子分类不存在' }, 404);
+        const idx = sub.files.findIndex(f=>f.name===fileName);
+        if (idx===-1) return json({ success:false, error:'文件不存在' }, 404);
+        sub.files.splice(idx,1);
+        const sha = (await storage.request('fileSystem.json'))?.sha;
+        const wRes = await storage.writeJSON('fileSystem.json', fs, sha);
+        if (wRes?.conflict) return json({ success:false, error:'冲突' }, 409);
+        const username = auth.username;
+        await storage.deleteFile(fileStoragePath(scope, username, folder.name, sub.name, fileName), null);
+        addAuditLog('delete_file', auth.username, ip);
+        return json({ success:true, data:{} });
+      }
+
+      if (path==='/restore-from-trash' && request.method==='POST') {
+        if (auth.role==='readonly') return json({ success:false, error:'权限不足' }, 403);
+        const { scope, index } = await request.json();
+        let fs = await storage.readJSON('fileSystem.json');
+        const container = scope==='public' ? fs.public : (fs.private?.[auth.username]||createDefaultPrivateFS());
+        const item = container.trash?.[index];
+        if (!item) return json({ success:false, error:'无效项目' }, 404);
+        if (item.type==='file') {
+          let tf = container.folders.find(f=>f.id===item.folderId);
+          if (!tf) { tf = { id:item.folderId, name:item.folderName||'已删除', passwordHash:'', passwordSalt:'', children:[] }; container.folders.push(tf); }
+          let ts = tf.children.find(c=>c.id===item.subId);
+          if (!ts) { ts = { id:item.subId||crypto.randomUUID(), name:item.subName||'已删除', files:[] }; tf.children.push(ts); }
+          ts.files.push(item.file);
+        } else if (item.type==='sub') {
+          let tf = container.folders.find(f=>f.id===item.folderId);
+          if (!tf) { tf = { id:item.folderId, name:item.folderName||'已删除', passwordHash:'', passwordSalt:'', children:[] }; container.folders.push(tf); }
+          tf.children.push(item.sub);
+        } else if (item.type==='folder') {
+          container.folders.push(item.folder);
+        }
+        container.trash.splice(index,1);
+        const sha = (await storage.request('fileSystem.json'))?.sha;
+        const wRes = await storage.writeJSON('fileSystem.json', fs, sha);
+        if (wRes?.conflict) return json({ success:false, error:'冲突' }, 409);
+        return json({ success:true, data:{} });
+      }
+
+      if (path==='/permanent-delete' && request.method==='POST') {
+        if (auth.role==='readonly') return json({ success:false, error:'权限不足' }, 403);
+        const { scope, index } = await request.json();
+        let fs = await storage.readJSON('fileSystem.json');
+        const container = scope==='public' ? fs.public : (fs.private?.[auth.username]||createDefaultPrivateFS());
+        const item = container.trash?.[index];
+        if (!item) return json({ success:false, error:'项目不存在' }, 404);
+        const username = auth.username;
+        if (item.type==='file') {
+          const fo = container.folders.find(f=>f.id===item.folderId);
+          const so = fo?.children?.find(c=>c.id===item.subId);
+          if (fo && so) await storage.deleteFile(fileStoragePath(scope, username, fo.name, so.name, item.file.name), null);
+        } else if (item.type==='sub') {
+          const fo = container.folders.find(f=>f.id===item.folderId);
+          if (fo) for (const f of item.sub.files) await storage.deleteFile(fileStoragePath(scope, username, fo.name, item.sub.name, f.name), null);
+        } else if (item.type==='folder') {
+          for (const c of item.folder.children) for (const f of c.files) await storage.deleteFile(fileStoragePath(scope, username, item.folder.name, c.name, f.name), null);
+        }
+        container.trash.splice(index,1);
+        const sha = (await storage.request('fileSystem.json'))?.sha;
+        const wRes = await storage.writeJSON('fileSystem.json', fs, sha);
+        if (wRes?.conflict) return json({ success:false, error:'冲突' }, 409);
+        addAuditLog('permanent_delete', auth.username, ip);
+        return json({ success:true, data:{} });
+      }
+
+      if (path==='/empty-trash' && request.method==='POST') {
+        if (auth.role==='readonly') return json({ success:false, error:'权限不足' }, 403);
+        const { scope } = await request.json();
+        if (!scope || !['public','private'].includes(scope)) return json({ success:false, error:'无效作用域' }, 400);
+        let fs = await storage.readJSON('fileSystem.json');
+        const container = scope==='public' ? fs.public : (fs.private?.[auth.username]||createDefaultPrivateFS());
+        const username = auth.username;
+        for (const item of container.trash||[]) {
+          if (item.type==='file') {
+            const fo = container.folders.find(f=>f.id===item.folderId);
+            const so = fo?.children?.find(c=>c.id===item.subId);
+            if (fo && so) await storage.deleteFile(fileStoragePath(scope, username, fo.name, so.name, item.file.name), null);
+          } else if (item.type==='sub') {
+            const fo = container.folders.find(f=>f.id===item.folderId);
+            if (fo) for (const f of item.sub.files) await storage.deleteFile(fileStoragePath(scope, username, fo.name, item.sub.name, f.name), null);
+          } else if (item.type==='folder') {
+            for (const c of item.folder.children) for (const f of c.files) await storage.deleteFile(fileStoragePath(scope, username, item.folder.name, c.name, f.name), null);
+          }
+        }
+        container.trash = [];
+        const sha = (await storage.request('fileSystem.json'))?.sha;
+        const wRes = await storage.writeJSON('fileSystem.json', fs, sha);
+        if (wRes?.conflict) return json({ success:false, error:'冲突' }, 409);
+        addAuditLog('empty_trash', auth.username, ip);
+        return json({ success:true, data:{} });
+      }
+
+      if (path==='/rename-folder' && request.method==='POST') {
+        if (auth.role==='readonly') return json({ success:false, error:'权限不足' }, 403);
+        const { scope, folderId, newName } = await request.json();
+        if (!scope || !folderId || !newName || !validFileName(newName)) return json({ success:false, error:'参数错误' }, 400);
+        let fs = await storage.readJSON('fileSystem.json');
+        const container = scope==='public' ? fs.public : (fs.private?.[auth.username]||createDefaultPrivateFS());
+        const folder = container.folders.find(f=>f.id===folderId);
+        if (!folder) return json({ success:false, error:'文件夹不存在' }, 404);
+        const oldName = folder.name;
+        folder.name = newName;
+        const sha = (await storage.request('fileSystem.json'))?.sha;
+        const wRes = await storage.writeJSON('fileSystem.json', fs, sha);
+        if (wRes?.conflict) return json({ success:false, error:'冲突' }, 409);
+        const username = auth.username;
+        const prefix = scope==='public' ? 'public_files' : `private_files/${encodeURIComponent(username)}`;
+        const oldPrefix = `${prefix}/${encodeURIComponent(oldName)}/`;
+        const files = await storage.listFiles(oldPrefix);
+        for (const fp of files) {
+          const newPath = fp.replace(oldPrefix, `${prefix}/${encodeURIComponent(newName)}/`);
+          const content = await storage.getContent(fp);
+          const exNew = await storage.request(newPath);
+          await storage.uploadFile(newPath, btoa(content), exNew?.sha);
+          const oldObj = await storage.request(fp);
+          if (oldObj?.sha) await storage.deleteFile(fp, oldObj.sha);
+        }
+        return json({ success:true, data:{ moved:files.length } });
+      }
+
+      if (path==='/rename-sub' && request.method==='POST') {
+        if (auth.role==='readonly') return json({ success:false, error:'权限不足' }, 403);
+        const { scope, folderId, subId, newSub } = await request.json();
+        if (!scope || !folderId || !subId || !newSub || !validFileName(newSub)) return json({ success:false, error:'参数错误' }, 400);
+        let fs = await storage.readJSON('fileSystem.json');
+        const container = scope==='public' ? fs.public : (fs.private?.[auth.username]||createDefaultPrivateFS());
+        const folder = container.folders.find(f=>f.id===folderId);
+        if (!folder) return json({ success:false, error:'文件夹不存在' }, 404);
+        const sub = folder.children.find(c=>c.id===subId);
+        if (!sub) return json({ success:false, error:'子分类不存在' }, 404);
+        const oldName = sub.name;
+        sub.name = newSub;
+        const sha = (await storage.request('fileSystem.json'))?.sha;
+        const wRes = await storage.writeJSON('fileSystem.json', fs, sha);
+        if (wRes?.conflict) return json({ success:false, error:'冲突' }, 409);
+        const username = auth.username;
+        const prefix = scope==='public' ? 'public_files' : `private_files/${encodeURIComponent(username)}`;
+        const oldPrefix = `${prefix}/${encodeURIComponent(folder.name)}/${encodeURIComponent(oldName)}/`;
+        const files = await storage.listFiles(oldPrefix);
+        for (const fp of files) {
+          const newPath = fp.replace(oldPrefix, `${prefix}/${encodeURIComponent(folder.name)}/${encodeURIComponent(newSub)}/`);
+          const content = await storage.getContent(fp);
+          const exNew = await storage.request(newPath);
+          await storage.uploadFile(newPath, btoa(content), exNew?.sha);
+          const oldObj = await storage.request(fp);
+          if (oldObj?.sha) await storage.deleteFile(fp, oldObj.sha);
+        }
+        return json({ success:true, data:{ moved:files.length } });
+      }
+
+      // ==================== 上传（含后端大小校验） ====================
+      if (path==='/upload-chunk' && request.method==='POST') {
+        if (auth.role==='readonly') return json({ success:false, error:'权限不足' }, 403);
+        const { scope, fileName, folder, subFolder, chunkIndex, totalChunks, data, mime, uploadId } = await request.json();
+        if (!scope || !validFileName(fileName) || !folder || !subFolder) return json({ success:false, error:'参数无效' }, 400);
+        // 分片大小限制（单分片不超过10MB）
+        if (data.length > 10 * 1024 * 1024) return json({ success:false, error:'分片过大' }, 400);
+        const username = auth.username;
+        const uid = uploadId || crypto.randomUUID();
+        const chunkPath = `chunks/${uid}/${chunkIndex}`;
+        const ex = await storage.request(chunkPath);
+        await storage.uploadFile(chunkPath, data, ex?.sha);
+        if (chunkIndex === totalChunks - 1) {
+          if (totalChunks * 10 * 1024 * 1024 > MAX_UPLOAD_SIZE + 10 * 1024 * 1024) return json({ success:false, error:'文件总大小超过限制' }, 400);
+          const chunks = [];
+          for (let i=0; i<totalChunks; i++) {
+            const r = await storage.getContent(`chunks/${uid}/${i}`);
+            if (!r) throw new Error(`缺失分片 ${i}`);
+            chunks.push(r);
+          }
+          const full = chunks.join('');
+          if (full.length > MAX_UPLOAD_SIZE) return json({ success:false, error:'文件过大' }, 400);
+          const targetPath = fileStoragePath(scope, username, folder, subFolder, fileName);
+          const exFile = await storage.request(targetPath);
+          await storage.uploadFile(targetPath, full, exFile?.sha);
+          for (let i=0; i<totalChunks; i++) {
+            const cp = `chunks/${uid}/${i}`;
+            const cm = await storage.request(cp);
+            if (cm?.sha) await storage.deleteFile(cp, cm.sha);
+          }
+          addAuditLog('upload_file', auth.username, ip);
+          return json({ success:true, data:{ merged:true } });
+        }
+        return json({ success:true, data:{ uploadId:uid } });
+      }
+
+      if (path==='/download-file' && request.method==='GET') {
+        const scope = url.searchParams.get('scope')||'public';
+        const folder = url.searchParams.get('folder');
+        const sub = url.searchParams.get('sub');
+        const file = url.searchParams.get('file');
+        if (!folder || !sub || !file) return json({ success:false, error:'缺少参数' }, 400);
+        const username = auth.username;
+        const fpath = fileStoragePath(scope, username, folder, sub, file);
+        const content = await storage.getContent(fpath);
+        if (!content) return json({ success:false, error:'文件不存在' }, 404);
+        return new Response(content, { headers: { 'Content-Type':'application/octet-stream', 'Content-Disposition':`attachment; filename="${file}"`, ...corsHeaders } });
+      }
+
+      if (path==='/edit-file' && request.method==='POST') {
+        if (auth.role==='readonly') return json({ success:false, error:'权限不足' }, 403);
+        const { scope, folder, subFolder, fileName, content } = await request.json();
+        if (!scope || !folder || !subFolder || !validFileName(fileName)) return json({ success:false, error:'参数错误' }, 400);
+        const str = String(content);
+        if (str.length > MAX_EDIT_SIZE) return json({ success:false, error:`内容超过${MAX_EDIT_SIZE/1024}KB` }, 400);
+        const username = auth.username;
+        const target = fileStoragePath(scope, username, folder, subFolder, fileName);
+        const ex = await storage.request(target);
+        if (!ex) return json({ success:false, error:'文件不存在' }, 404);
+        const encoded = btoa(unescape(encodeURIComponent(str)));
+        await storage.uploadFile(target, encoded, ex.sha);
+        return json({ success:true, data:{} });
+      }
+
+      if (path==='/upload-avatar' && request.method==='POST') {
+        if (auth.role==='readonly') return json({ success:false, error:'权限不足' }, 403);
+        const { data, mime } = await request.json();
+        if (!data || !mime) return json({ success:false, error:'缺少数据' }, 400);
+        if (data.length > MAX_AVATAR_SIZE) return json({ success:false, error:'头像图片不能超过500KB' }, 400);
+        const ext = mime.split('/')[1]||'png';
+        const fileName = `avatar_${auth.username}_${Date.now()}.${ext}`;
+        const avatarPath = `avatars/${fileName}`;
+        await storage.uploadFile(avatarPath, data);
+        const avatarUrl = `https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/${BRANCH}/${avatarPath}`;
+        const users = await storage.readJSON('users.json', []);
+        const idx = users.findIndex(u=>u.username===auth.username);
+        if (idx!==-1) { users[idx].avatar = avatarUrl; await storage.writeJSON('users.json', users, (await storage.request('users.json'))?.sha); }
+        return json({ success:true, data:{ avatarUrl } });
+      }
+
+      if (path==='/upload-background' && request.method==='POST') {
+        if (auth.role==='readonly') return json({ success:false, error:'权限不足' }, 403);
+        const { data, mime } = await request.json();
+        if (!data || !mime) return json({ success:false, error:'缺少数据' }, 400);
+        if (data.length > MAX_BG_SIZE) return json({ success:false, error:'背景图片不能超过2MB' }, 400);
+        const bgPath = `backgrounds/${auth.username}.webp`;
+        const ex = await storage.request(bgPath);
+        await storage.uploadFile(bgPath, data, ex?.sha);
+        const bgUrl = `https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/${BRANCH}/${bgPath}?t=${Date.now()}`;
+        const users = await storage.readJSON('users.json', []);
+        const idx = users.findIndex(u=>u.username===auth.username);
+        if (idx!==-1) { users[idx].background = bgUrl; await storage.writeJSON('users.json', users, (await storage.request('users.json'))?.sha); }
+        return json({ success:true, data:{ backgroundUrl:bgUrl } });
+      }
+
+      // ==================== 修改资料（含用户名迁移） ====================
+      if (path==='/update-profile' && request.method==='POST') {
+        const { oldPassword, newPassword, oldSecondPassword, newSecondPassword, newUsername, avatar } = await request.json();
+        let users = await storage.readJSON('users.json', []);
+        const idx = users.findIndex(u=>u.username===auth.username);
+        if (idx===-1) return json({ success:false, error:'用户不存在' }, 404);
+        if (newPassword) {
+          if (!oldPassword) return json({ success:false, error:'需要原密码' }, 400);
+          if ((await hashPassword(oldPassword, users[idx].salt)) !== users[idx].passwordHash) return json({ success:false, error:'原密码错误' }, 401);
+          if (newPassword.length<6) return json({ success:false, error:'新密码至少6位' }, 400);
+          users[idx].passwordHash = await hashPassword(newPassword, users[idx].salt);
+          addAuditLog('change_password', auth.username, ip);
+        }
+        if (newSecondPassword) {
+          if (!oldSecondPassword) return json({ success:false, error:'需要原二级密码' }, 400);
+          const ss = users[idx].secondSalt||users[idx].salt;
+          if ((await hashPassword(oldSecondPassword, ss)) !== users[idx].secondHash) return json({ success:false, error:'原二级密码错误' }, 401);
+          if (!/^\d{6}$/.test(newSecondPassword)) return json({ success:false, error:'二级密码需6位数字' }, 400);
+          const nss = crypto.randomUUID();
+          users[idx].secondHash = await hashPassword(newSecondPassword, nss);
+          users[idx].secondSalt = nss;
+          addAuditLog('change_second_password', auth.username, ip);
+        }
+        if (newUsername && newUsername!==auth.username) {
+          if (newUsername.length<4||newUsername.length>20) return json({ success:false, error:'用户名4-20字符' }, 400);
+          if (users.find((u,i)=>i!==idx && u.username===newUsername)) return json({ success:false, error:'用户名已存在' }, 400);
+          const oldUsername = users[idx].username;
+          users[idx].username = newUsername;
+          // 迁移私有空间
+          let fs = await storage.readJSON('fileSystem.json');
+          if (fs && fs.private && fs.private[oldUsername]) {
+            fs.private[newUsername] = fs.private[oldUsername];
+            delete fs.private[oldUsername];
+            await storage.writeJSON('fileSystem.json', fs, (await storage.request('fileSystem.json'))?.sha);
+          }
+          addAuditLog('change_username', auth.username, ip);
+        }
+        if (avatar!==undefined) {
+          if (avatar && !avatar.startsWith('https://')) return json({ success:false, error:'头像地址必须以 https:// 开头' }, 400);
+          users[idx].avatar = avatar||'';
+        }
+        const sha = (await storage.request('users.json'))?.sha;
+        const wRes = await storage.writeJSON('users.json', users, sha);
+        if (wRes?.conflict) return json({ success:false, error:'系统繁忙，请稍后重试' }, 409);
+        const newToken = await signJWT({
+          username:users[idx].username, role:users[idx].role, type:'full',
+          iat:Math.floor(Date.now()/1000), exp:Math.floor(Date.now()/1000)+TOKEN_EXPIRY,
+          jti:crypto.randomUUID(), ip, ua:uaHash
+        }, JWT_SECRET);
+        return json({ success:true, data:{ token:newToken, newUsername:users[idx].username, avatar:users[idx].avatar } });
+      }
+
+      if (path==='/search' && request.method==='POST') {
+        const { query, scope } = await request.json();
+        if (!query || query.length<2) return json({ success:false, error:'关键词至少2个字符' }, 400);
+        const fs = await storage.readJSON('fileSystem.json');
+        if (!fs) return json({ success:true, data:{ results:[] } });
+        const results = [];
+        const lowerQuery = query.toLowerCase();
+        const maxFileSize = 500 * 1024;
+        async function searchContainer(container, s, username) {
+          if (!container?.folders) return;
+          for (const folder of container.folders) {
+            if (!folder.children) continue;
+            for (const sub of folder.children) {
+              if (!sub.files) continue;
+              for (const file of sub.files) {
+                const isText = /\.(txt|md|json|csv|py|js|html|css|log|xml|yaml)$/i.test(file.name);
+                if (!isText) continue;
+                if (file.size && file.size > maxFileSize) continue;
+                if (file.name.toLowerCase().includes(lowerQuery)) {
+                  results.push({ scope:s, folder:folder.name, sub:sub.name, file:file.name, matchType:'filename', context:'' });
+                  continue;
+                }
+                try {
+                  const content = await storage.getContent(fileStoragePath(s, username, folder.name, sub.name, file.name));
+                  if (content && content.toLowerCase().includes(lowerQuery)) {
+                    const idx = content.toLowerCase().indexOf(lowerQuery);
+                    const start = Math.max(0, idx-30), end = Math.min(content.length, idx+query.length+30);
+                    results.push({ scope:s, folder:folder.name, sub:sub.name, file:file.name, matchType:'content', context:content.substring(start,end) });
+                  }
+                } catch {}
+              }
+            }
+          }
+        }
+        if (!scope || scope==='public') await searchContainer(fs.public, 'public', '');
+        if (!scope || scope==='private') if (fs.private?.[auth.username]) await searchContainer(fs.private[auth.username], 'private', auth.username);
+        return json({ success:true, data:{ results } });
+      }
+
+      return new Response('Not Found', { status:404, headers:corsHeaders });
+    } catch (err) {
+      console.error(err);
+      return json({ success:false, error:'服务器内部错误' }, 500);
+    }
+  }
+};
